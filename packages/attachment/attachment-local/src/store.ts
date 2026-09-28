@@ -127,7 +127,10 @@ export async function prepareImageFile(
  * Make a directory's entries durable (fsync on a read-only directory handle).
  * A synced file alone does not survive a crash when its directory entry never
  * reached storage, so the publication directory is synced before a durable
- * reference is reported.
+ * reference is reported. Filesystems that reject directory fsync (autofs
+ * mount points, some NFS and overlay configurations) own entry durability in
+ * the server or underlying filesystem, so an unsupported-fsync failure is
+ * best-effort there, as on Windows where metadata journaling plays that role.
  */
 async function syncDirectory(path: string): Promise<void> {
   /* v8 ignore next -- Windows cannot open directory handles; NTFS metadata journaling owns entry durability there. */
@@ -135,7 +138,13 @@ async function syncDirectory(path: string): Promise<void> {
   /* v8 ignore start -- Windows cannot exercise directory fsync; POSIX behavior tests enforce this peer. */
   const handle = await open(path, constants.O_RDONLY)
   try {
-    await handle.sync()
+    try {
+      await handle.sync()
+    } catch (error) {
+      /* v8 ignore next -- autofs and some NFS and overlay filesystems reject directory fsync; the server owns entry durability there. */
+      if (error instanceof Error && 'code' in error && (error.code === 'EINVAL' || error.code === 'ENOSYS' || error.code === 'ENOTSUP')) return
+      throw error
+    }
   } finally {
     await handle.close()
   }

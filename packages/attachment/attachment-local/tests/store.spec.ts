@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { constants } from 'node:fs'
 import { chmod, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
+import type { FileHandle } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, parse, resolve } from 'node:path'
 import { mkdtemp, rm } from 'node:fs/promises'
@@ -19,6 +20,7 @@ import {
 const fsControl = vi.hoisted(() => ({
   readSignals: [] as AbortSignal[],
   syncedDirectories: [] as string[],
+  rejectDirectorySync: new Map<string, string>(),
 }))
 
 vi.mock('node:fs/promises', async (importOriginal) => {
@@ -34,7 +36,23 @@ vi.mock('node:fs/promises', async (importOriginal) => {
       return actual.readFile(...args)
     },
     async open(...args: Parameters<typeof actual.open>): ReturnType<typeof actual.open> {
-      if (args[1] === constants.O_RDONLY) fsControl.syncedDirectories.push(String(args[0]))
+      if (args[1] === constants.O_RDONLY) {
+        const target = String(args[0])
+        fsControl.syncedDirectories.push(target)
+        const code = fsControl.rejectDirectorySync.get(target)
+        if (code !== undefined) {
+          const failure = Object.assign(new Error('invalid argument, fsync'), { code })
+          const handle = await actual.open(target, constants.O_RDONLY)
+          return new Proxy(handle, {
+            get(syncTarget: FileHandle, property: string | symbol) {
+              if (property === 'sync') return () => Promise.reject(failure)
+              if (property === 'close') return syncTarget.close.bind(syncTarget)
+              if (property === 'then') return undefined
+              throw new Error(`unsupported directory handle access: ${String(property)}`)
+            },
+          })
+        }
+      }
       return actual.open(...args)
     },
   }
@@ -76,6 +94,7 @@ function parentChainToRoot(path: string): string[] {
 }
 
 afterEach(async () => {
+  fsControl.rejectDirectorySync.clear()
   await Promise.all(roots.splice(0).map(path => rm(path, { recursive: true, force: true })))
 })
 
@@ -109,6 +128,27 @@ describe('local attachment store', () => {
       bucket,
       objects,
     ])
+  })
+
+  it.skipIf(process.platform === 'win32')('completes a save when an ancestor directory rejects fsync as unsupported', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'dsh-attachment-'))
+    roots.push(base)
+    const storageRoot = join(base, 'home', 'attachments', 'v1')
+    fsControl.rejectDirectorySync.set(base, 'EINVAL')
+
+    const ref = await saveImageFile(storageRoot, { data: PNG, mediaType: 'image/png' }, LIMITS, POLICY)
+
+    await expect(readImageFile(storageRoot, ref)).resolves.toEqual({ ref, data: PNG })
+  })
+
+  it.skipIf(process.platform === 'win32')('fails a save when an ancestor directory fsync fails with a real I/O error', async () => {
+    const base = await mkdtemp(join(tmpdir(), 'dsh-attachment-'))
+    roots.push(base)
+    const storageRoot = join(base, 'home', 'attachments', 'v1')
+    fsControl.rejectDirectorySync.set(base, 'EIO')
+
+    await expect(saveImageFile(storageRoot, { data: PNG, mediaType: 'image/png' }, LIMITS, POLICY))
+      .rejects.toMatchObject({ code: 'EIO' })
   })
 
   it('creates and persists a missing nested home directory against the filesystem root', async () => {
